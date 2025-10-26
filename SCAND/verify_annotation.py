@@ -132,6 +132,7 @@ def verify_annotations():
 
         annotation_timstamps = ann_data.get("annotations_by_stamp")
         frame_items : list[FrameItem] = []
+
         with rosbag.Bag(bag_path, 'r') as bag:
 
             for idx, (topic, msg, t) in enumerate(bag.read_messages(topics=[img_topic])):

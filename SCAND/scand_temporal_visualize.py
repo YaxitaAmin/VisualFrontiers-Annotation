@@ -21,14 +21,12 @@ from cv_bridge import CvBridge
 
 from vis_utils import camray_to_ground_in_base, transform_points, load_calibration, \
     make_corridor_polygon, draw_polyline, draw_corridor, project_points_cam, add_first_point, \
-    project_clip, make_corridor_polygon_from_cam_lines, clean_2d
-from traj_utils import solve_arc_from_point, arc_to_traj, make_offset_paths, create_yaws_from_path, \
-    make_offset_path_to_point
+    project_clip, make_corridor_polygon_from_cam_lines
+from traj_utils import solve_arc_from_point, arc_to_traj, make_offset_paths, create_yaws_from_path
 from utils import get_topics_from_bag
 
 # Colors (BGR)
-COLOR_PATH_ONE = (0, 0, 255)    # RED
-COLOR_PATH_TWO = (0, 255, 0)    # GREEN
+COLOR_PATH = (0, 0, 255)    # RED
 COLOR_LAST = (0, 165, 255)  # ORANGE
 COLOR_CLICK = (255, 0, 0)   # BLUE
 
@@ -47,7 +45,6 @@ class FrameItem:
     rotation: np.ndarray
     yaw: float
 
-@dataclass
 class PathItem:
     path_points: np.ndarray
     left_boundary: np.ndarray
@@ -58,28 +55,16 @@ class PathItem:
 # Main Annotator
 # ===========================
 class TemporalAnnotator:
-    def __init__(self, bag_path, calib_path, topics_path, annotations_root, expert_action_annotation_dir, lookahead=5, num_keypoints=5, max_deviation=1.5):
+    def __init__(self, bag_path, calib_path, topics_path, annotations_root, lookahead=5, num_keypoints=5, max_deviation=1.5):
         self.bag_path = bag_path
         self.bag_name = Path(bag_path).name
         self.needs_correction = False
         stem = Path(self.bag_name).stem
         self.output_path = os.path.join(annotations_root, f"{stem}.json")
 
-
-        self.expert_action_annotation_dir = os.path.join(expert_action_annotation_dir, self.bag_name.replace(".bag", ".json"))
-
         with open(topics_path, 'r') as f:
             topics = json.load(f)
         
-        try:
-            with open(self.expert_action_annotation_dir, 'r') as f:
-                self.action_annotations = json.load(f)
-        except Exception as e:
-            print(f"[WARN] Could not load expert action annotations from {self.expert_action_annotation_dir}: {e}")
-            raise e
-        
-        self.timestamps = self._get_timestamps_from_expert_annotations()
-        print(len(self.timestamps), "timestamps from expert annotations loaded.")
         if "Jackal" in self.bag_name:
             self.K, self.dist, self.T_base_from_cam = load_calibration(calib_path, fx, fy, cx, cy, mode="jackal")
             self.T_cam_from_base = np.linalg.inv(self.T_base_from_cam)
@@ -108,6 +93,13 @@ class TemporalAnnotator:
         self.current_img = None
         self.current_img_show = None        
 
+        self.current_target_base = None   # (x,y,0) in base_link
+        self.current_r_theta_vw = None    # (r, theta, v, w)
+
+        self.writer = None
+
+        self.last_selection_record = None  # (r,θ,v,ω,thick)
+        self.last_click_uv = None
         self.frame_idx = -1
         self.frame_stamp = None
 
@@ -122,28 +114,13 @@ class TemporalAnnotator:
         self.max_deviation = max_deviation
 
         self.paths : list[PathItem] = []
-        self.comp_pairs = [(0,1), (0,2), (0,3), (1,2), (1,3), (2,3)]
-
-        self.active_pairs = list(self.comp_pairs)
-        self.active_pair_idx = 0
-        self._one_gt_two = None
-        self.prefs_this_frame = []
-        self._finalize_and_advance = False
-
-    def _get_timestamps_from_expert_annotations(self):
-        timestamps = []
-        for key in self.action_annotations.get("annotations_by_stamp", {}).keys():
-            timestamps.append(int(key))
-        return timestamps
 
     def _open_bag_doc(self):
-        bag_doc = {
+        self.bag_doc = {
             "bag": self.bag_name,
             "image_topic": self.image_topic,
             "annotations_by_stamp": {}
         }
-
-        return bag_doc
 
     def _close_bag_doc(self):
         if self.bag_doc is not None:
@@ -152,93 +129,72 @@ class TemporalAnnotator:
             self.bag_doc = None
 
     def draw(self):
-        if self.current_img is None or not self.paths:
+        if self.current_img is None:
             return
         img = self.current_img.copy()
         img_h, img_w = img.shape[:2]
+        # Draw centerline in red
+        if self.path is not None:
+            # Build corridor (in base frame)
+            left_b, right_b, poly_b = make_corridor_polygon(self.path, self.yaws, self.robot_width)
 
-        # pick current pair; fallback to (0,1)
-        if 0 <= self.active_pair_idx < len(self.active_pairs):
-            i, j = self.active_pairs[self.active_pair_idx]
-        else:
-            i, j = (0, 1)
+            # Centerline & edges: project → clip bottom → optional smooth first segment
+            points_2d = project_clip(self.path, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True)
 
-        def check_left_right(pitem_1: PathItem, pitem_2: PathItem) -> Tuple[int, int]:
-            # Determine which path is left/right based on the first point
-            p1_last = pitem_1.path_points[-1]
-            p2_last = pitem_2.path_points[-1]
+            # print(points_2d.shape)
+            left_2d   = project_clip(left_b, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True)
+            right_2d  = project_clip(right_b, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True)
 
-            if p1_last[1] > p2_last[1]:
-                return (i, j)
-            else:
-                return (j, i)
-            
-
-        def draw_one(pitem, color):
-            points_2d = clean_2d(project_clip(pitem.path_points, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True), img_w, img_h)
-            left_2d   = clean_2d(project_clip(pitem.left_boundary,  self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True), img_w, img_h)
-            right_2d  = clean_2d(project_clip(pitem.right_boundary, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True), img_w, img_h)
-            # points_2d = project_clip(pitem.path_points, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True)
-            # left_2d   = project_clip(pitem.left_boundary,  self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True)
-            # right_2d  = project_clip(pitem.right_boundary, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True)
+            points_2d_p1 = project_clip(self.comparison_paths[0], self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True)
+            points_2d_p2 = project_clip(self.comparison_paths[1], self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True)
+            # Corridor fill polygon: you can either rebuild from clipped edges or just project+clip the polygon
+            # (If poly_b is already a stitched left+right, clip it similarly)
             poly_2d   = make_corridor_polygon_from_cam_lines(left_2d, right_2d)
-            draw_polyline(img, points_2d, 2, color)
-            draw_corridor(img, poly_2d, left_2d, right_2d, fill_alpha=0.35, fill_color=color, edge_color=color, edge_thickness=2)
 
-        i, j = check_left_right(self.paths[i], self.paths[j])
-        self.active_pairs[self.active_pair_idx] = (i, j)
-        
-        if i < len(self.paths): draw_one(self.paths[i], COLOR_PATH_ONE)     # RED
-        if j < len(self.paths): draw_one(self.paths[j], COLOR_PATH_TWO)     # GREEN
 
-        label = f"Compare ({i},{j})  [1]=RED  [2]=GREEN  ({self.active_pair_idx+1}/{len(self.active_pairs)})"
-        cv2.putText(img, label, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-
+            draw_polyline(img, points_2d, 2, COLOR_PATH)
+            draw_polyline(img, points_2d_p1, 2, (0,255,0))  # GREEN
+            draw_polyline(img, points_2d_p2, 2, (255,0,255))  # PURPLE
+            draw_corridor(img, poly_2d, left_2d, right_2d, fill_alpha=0.35, fill_color=COLOR_PATH, edge_color=COLOR_PATH, edge_thickness=2)
+            
         self.current_img_show = img
         cv2.imshow(self.window, self.current_img_show)
-        
-    def _path_item_to_dict(self, pitem: PathItem, stamp_obj):
-        # stamp as a string for readability; also give a per-point parallel stamp list if you want
-        stamp_str = str(stamp_obj)
-        return {
-            "points": pitem.path_points.tolist(),
-            "left_boundary": pitem.left_boundary.tolist(),
-            "right_boundary": pitem.right_boundary.tolist(),
-            "timestamp": stamp_str
-        }
-
-    def reset(self):
-        self.paths = []
-        self.prefs_this_frame = []
-        self._one_gt_two = None
-        self._finalize_and_advance = False
-        self.active_pairs = list(self.comp_pairs)  # phase 1 again
-        self.active_pair_idx = 0
 
     def log_frame(self):
+        if self.bag_doc is None:
+            raise RuntimeError("bag doc not open")
+
+        u, v = self.last_click_uv
+        r, theta, _, _, _ = self.last_selection_record            
+
+        if self.frame_stamp is None:
+            return  # nothing to log
+
+        stamp_key = str(self.frame_stamp)
+        # print(stamp_key)
+        self.bag_doc["annotations_by_stamp"][stamp_key] = {
+            "frame_idx": int(self.frame_idx),
+            "click": {"u": u, "v": v},
+            "arc": {"r": r, "theta": theta}, 
+            "robot_width": self.robot_width
+        }
+
+        # clear per-frame transient state
+        self.current_target_base = None
+        self.current_r_theta_vw = None
+
+    def log_stop(self):
         if self.bag_doc is None or self.frame_stamp is None:
             return
-        stamp_key = str(self.frame_stamp)
 
-        paths_dict = {}
-        for idx, pitem in enumerate(self.paths[:5]):  # ensure 0..4 exist
-            if self._one_gt_two:
-                if idx == 4:
-                    continue
-            elif not self._one_gt_two:
-                if idx == 3:
-                    continue
-
-            paths_dict[str(idx)] = self._path_item_to_dict(pitem, self.frame_stamp)
-
-        ranking = self._compute_ranking()
+        stamp_key = str(self.frame_stamp)  # keep same format you use in log_frame
 
         self.bag_doc["annotations_by_stamp"][stamp_key] = {
             "frame_idx": int(self.frame_idx),
-            "robot_width": self.robot_width,
-            "paths": paths_dict,
-            "preference": ranking,
-            "pairwise": self.prefs_this_frame
+            "stop": True,
+            "click": None,                     # no pixel click
+            "goal_base": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "arc": {"r": 0.0, "theta": 0.0}
         }
 
     def process_odom(self, msg):
@@ -264,41 +220,21 @@ class TemporalAnnotator:
         cv_img = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
 
         return cv_img
-
-    def _compute_ranking(self):
-        # participating indices:
-        idxs = [0,1,2,3] if self._one_gt_two else [0,1,2,4]
-        wins = {k:0 for k in idxs}
-        for e in self.prefs_this_frame:
-            i, j = e["pair"]; c = e["choice"]
-            if i in wins and j in wins and c in wins:
-                wins[c] += 1
-        order = sorted(idxs, key=lambda k: (-wins[k], k))  # tie -> lower index
-        return order
     
-    def _record_choice(self, chosen_idx: int):
-        if self.active_pair_idx < 0 or self.active_pair_idx >= len(self.active_pairs):
-            return
-        pair = self.active_pairs[self.active_pair_idx]
-        self.prefs_this_frame.append({"pair": [int(pair[0]), int(pair[1])], "choice": int(chosen_idx)})
-
-        if set(pair) == {1, 2}:
-            self._one_gt_two = (chosen_idx == 1)
-
-        self.active_pair_idx += 1
-
-        # If we just finished the current list of pairs, decide next phase
-        if self.active_pair_idx == len(self.active_pairs):
-            self._finalize_and_advance = True
-
     def create_path_item(self, path_points: np.ndarray, yaws: np.ndarray) -> PathItem:
 
         if yaws is None:
             yaws = create_yaws_from_path(path_points)
 
         left_b, right_b, poly_b = make_corridor_polygon(path_points, yaws, self.robot_width)
-        
-        return PathItem(path_points=path_points, left_boundary=left_b, right_boundary=right_b, polygon=poly_b)
+        path_item = PathItem()
+
+        path_item.path_points = path_points
+        path_item.left_boundary = left_b
+        path_item.right_boundary = right_b
+        path_item.polygon = poly_b
+
+        return path_item
 
     def compute_comparison_paths(self):
 
@@ -312,24 +248,16 @@ class TemporalAnnotator:
         left_offset_path, right_offset_path = make_offset_paths(self.path, self.yaws, offsets)
 
         #Hann conv offsets
-        # offset = np.random.uniform(self.robot_width/2, self.robot_width)
-        # base = 0.5 * (1.0 - np.cos(2.0 * np.pi * offset_ratios))
-        # gamma = 1.0
-        # w = base ** gamma
-        # conv_offsets = offset * w
+        offset = np.random.uniform(self.robot_width/2, self.robot_width)
+        base = 0.5 * (1.0 - np.cos(2.0 * np.pi * offset_ratios))
+        gamma = 1.0
+        w = base ** gamma
+        conv_offsets = offset * w
 
-        # # print(conv_offsets)
-        # left_conv_path, right_conv_path = make_offset_paths(self.path, self.yaws, conv_offsets)
-        annotator_goal = self.action_annotations.get("annotations_by_stamp", {}).get(str(self.frame_stamp), {}).get("goal_base", None)
+        # print(conv_offsets)
+        left_conv_path, right_conv_path = make_offset_paths(self.path, self.yaws, conv_offsets)
 
-        if annotator_goal is None:
-            raise Exception
-
-        annotator_goal = np.array([annotator_goal['x'], annotator_goal['y'], annotator_goal['z']])        
-        expert_path = make_offset_path_to_point(self.path, self.yaws, annotator_goal, self.cum_dists)
-
-
-        return left_offset_path, right_offset_path, expert_path
+        return left_offset_path, right_offset_path, left_conv_path, right_conv_path
     
     def compute_path(self):
 
@@ -389,7 +317,6 @@ class TemporalAnnotator:
         path_r[:,2] = 0.0
         yaws = yaws[valid]
         cum_dists = cum_dists[valid]
-
         return path_r, yaws, cum_dists
     
     def dynamic_lookahead(self, v: float, w: float,
@@ -415,27 +342,20 @@ class TemporalAnnotator:
     
     def process_bag(self, undersampling_factor):
         
-        # print(self.timestamps[:10])
         count = 0
-        timestamp_counter = 0
         with rosbag.Bag(self.bag_path, "r") as bag:
             pos_defined = False
             for i, (topic, msg, t) in enumerate(bag.read_messages(topics=[self.image_topic, self.odom_topic])):
-                # print(int(str(t)), int(self.timestamps[timestamp_counter]))
-                # if(int(str(t)) > int(self.timestamps[timestamp_counter])):
-                #     break
+                
                 if topic == self.odom_topic:
                     pos, v, w, rot, yaw = self.process_odom(msg)
                     pos_defined = True
                 elif topic == self.image_topic:
                     cv_img = self.process_image(msg)
 
-                    if pos_defined and str(t) == str(self.timestamps[timestamp_counter]):
-                        self.frames.append(FrameItem(idx=count, stamp=t, img=cv_img, position=pos, velocity=v, omega=w, rotation=rot, yaw = yaw))
-                        timestamp_counter += 1
-                        count+=1       
-                if timestamp_counter >= len(self.timestamps):
-                    break 
+                    if pos_defined and i%undersampling_factor == 0:
+                        self.frames.append(FrameItem(idx=count, stamp=t, img=cv_img, position=pos, velocity=v, omega=w, rotation=rot, yaw = yaw))   
+                        count+=1        
 
         if not self.frames:
             print("[WARN] No frames after undersampling.")
@@ -448,53 +368,33 @@ class TemporalAnnotator:
                 self.frame_idx = fr.idx
                 self.frame_stamp = fr.stamp
                 self.current_img = fr.img
-                self.reset()
-
+                
                 self.path, self.yaws, self.cum_dists = self.compute_path()
                 self.paths.append(self.create_path_item(self.path, self.yaws))
+                # print(self.path)
+                left_offset_path, right_offset_path, left_conv_path, right_conv_path = self.compute_comparison_paths()
+                self.comparison_paths = [left_offset_path, right_offset_path, left_conv_path, right_conv_path]
 
-                # fast-skip degenerate/off-view frames
-                if (self.path is None or self.path.shape[0] < 2 or
-                    self.cum_dists is None or self.cum_dists.size == 0 or
-                    self.cum_dists[-1] <= 1.0):
+                # for p in self.comparison_paths:
+                #     self.paths.append(self.create_path_item(p, yaws=None))
+
+
+                self.draw()
+                key = cv2.waitKey(0) & 0xFF
+
+                if key in (ord('q'), 27):   # q or ESC
+                    print("[INFO] Quit requested.")
+                    return
+
+                elif key == 83:  # Right Arrow → save (using last_*) then next
+                    # self.log_frame()
                     i += 1
+
+                elif key == 81:  # Left Arrow → go back one (no save)
+                    print("[INFO] Back one frame.")
+                    i = max(0, i - 1)
+                else:
                     continue
-
-                left_offset_path, right_offset_path, annotator_path = self.compute_comparison_paths()
-                self.comparison_paths = [left_offset_path, right_offset_path, annotator_path] #[1,2,3,4]
-
-                for p in self.comparison_paths:
-                    self.paths.append(self.create_path_item(p, yaws=None))
-
-                while True:
-                    self.draw()
-                    key = cv2.waitKey(0) & 0xFF
-                        
-                    if key in (ord('q'), 27):   # q or ESC
-                        print("[INFO] Quit requested.")
-                        return
-
-                    elif key == ord('1'):
-                        cur = self.active_pairs[self.active_pair_idx] if self.active_pair_idx < len(self.active_pairs) else None
-                        if cur is not None:
-                            self._record_choice(cur[0])
-
-                    elif key == ord('2'):
-                        cur = self.active_pairs[self.active_pair_idx] if self.active_pair_idx < len(self.active_pairs) else None
-                        if cur is not None:
-                            self._record_choice(cur[1])
-
-                    elif key == 81:  # Left Arrow → go back one (no save)
-                        print("[INFO] Back one frame.")
-                        i = max(0, i - 1)
-                        break
-                    else:
-                        continue
-
-                    if self._finalize_and_advance:
-                        self.log_frame()
-                        i += 1
-                        break
 
         finally:
             self._close_bag_doc()
@@ -506,7 +406,6 @@ if __name__ == "__main__":
     # ===========================
 
     bag_dir = "/media/beast-gamma/Media/Datasets/SCAND/annt"   # Point to path with rosbags being annotated for the day
-    expert_action_annotation_dir = "/media/beast-gamma/Media/Datasets/SCAND/ActionAnnotations"
     annotations_root = "./Annotations"
     calib_path = "./tf.json"
     skip_json_path = "./bags_to_skip.json"
@@ -536,7 +435,8 @@ if __name__ == "__main__":
             continue
         
         print(f"[INFO] Processing {bp}")
-        annotator = TemporalAnnotator(bp, calib_path, topic_json_path, annotations_root, expert_action_annotation_dir, lookahead, num_keypoints, max_deviation)
+        
+        annotator = TemporalAnnotator(bp, calib_path, topic_json_path, annotations_root, lookahead, num_keypoints, max_deviation)
         annotator.process_bag(undersampling_factor)
 
     print(f"\n[DONE] Annotations written to {annotator.output_path}")

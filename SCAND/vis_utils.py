@@ -59,6 +59,18 @@ def make_corridor_polygon(traj_b: np.ndarray,
     poly_b = np.vstack([left_b, bridge_end,right_b[::-1]])
     return left_b, right_b, poly_b
 
+def make_corridor_polygon_from_cam_lines(left_c: np.ndarray,
+                          right_c: np.ndarray, 
+                          bridge_pts: int = 15) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+
+    if bridge_pts > 0:
+        bx = np.linspace(left_c[-1][0], right_c[-1][0], bridge_pts)
+        by = np.linspace(left_c[-1][1], right_c[-1][1], bridge_pts)
+        bridge_end = np.stack([bx, by], axis=1)
+    # Build polygon: left (0→N-1) + right (N-1→0)
+    poly_c = np.vstack([left_c, bridge_end, right_c[::-1]])
+    return poly_c
+
 def draw_polyline(img: np.ndarray, pts2d: np.ndarray, thickness: int, color):
     H, W = img.shape[:2]
     poly = []
@@ -109,6 +121,29 @@ def project_points_cam(K: np.ndarray, dist, P_cam: np.ndarray) -> np.ndarray:
     tvec = np.zeros((3, 1), dtype=np.float64)
     pts2d, _ = cv2.projectPoints(P_cam.astype(np.float64), rvec, tvec, K, None)
     return pts2d.reshape(-1, 2)
+
+def add_first_point(points_2d: np.ndarray, img_h: int) -> np.ndarray:
+    yb = float(img_h - 1)
+    n = len(points_2d)
+    if n == 0:
+        return points_2d
+
+    # If the very first vertex is already on the bottom row, nothing to add.
+    if abs(points_2d[0, 0] - yb) < 1e-9:
+        return points_2d
+
+    # Find the FIRST segment that crosses y = yb
+    for i in range(n - 1):
+        y0, y1 = points_2d[i, 1], points_2d[i + 1, 1]
+
+        if (y0 - yb) * (y1 - yb) <= 0 and y0 != y1:
+            t = (yb - y0) / (y1 - y0)                 # linear interp param along the segment
+            x = points_2d[i, 0] + t * (points_2d[i + 1, 0] - points_2d[i, 0])
+            inter = np.array([[x, yb]])               # keep [y, x] ordering
+            return np.vstack([points_2d[:i+1], inter, points_2d[i+1:]])
+
+    # No crossing found: optionally clamp first vertex to bottom row
+    return points_2d
 
 def transform_points(T: np.ndarray, P: np.ndarray) -> np.ndarray:
     """Apply 4x4 transform to Nx3 points; returns Nx3."""
@@ -184,3 +219,85 @@ def pixel_to_ray_cam(u: float, v: float, K: np.ndarray) -> np.ndarray:
     uv1 = np.array([u, v, 1.0], dtype=np.float64)
     rc = Kinv @ uv1
     return rc / np.linalg.norm(rc)
+
+def clip_to_bottom_xy(poly_xy: np.ndarray, img_h: int) -> np.ndarray:
+    """Clip a [x,y] polyline to the bottom scanline y=img_h-1, inserting the exact intersection."""
+    if poly_xy is None or len(poly_xy) == 0:
+        return poly_xy
+    pts = poly_xy.astype(float, copy=True)
+    yb = float(img_h - 1)
+
+    # Already starts on the bottom row?
+    if abs(pts[0,1] - yb) < 1e-6:
+        return pts
+
+    # Find first adjacent segment that spans yb and insert intersection
+    for i in range(len(pts)-1):
+        y0, y1 = pts[i,1], pts[i+1,1]
+        if y0 == y1:
+            if abs(y0 - yb) < 1e-6:
+                return pts[i:].copy()
+            continue
+        if (y0 - yb) * (y1 - yb) <= 0:  # spans scanline
+            t = (yb - y0) / (y1 - y0)
+            t = max(0.0, min(1.0, t))
+            x = pts[i,0] + t * (pts[i+1,0] - pts[i,0])
+            inter = np.array([[x, yb]], dtype=float)
+            return np.vstack([inter, pts[i+1:]])
+
+    # No crossing (entire poly above): optional extrapolation
+    if len(pts) >= 2 and pts[0,1] != pts[1,1]:
+        t = (yb - pts[0,1]) / (pts[1,1] - pts[0,1])
+        x = pts[0,0] + t * (pts[1,0] - pts[0,0])
+    else:
+        x = pts[0,0]
+    inter = np.array([[x, yb]], dtype=float)
+    return np.vstack([inter, pts])
+
+def densify_first_segment_xy(poly_xy: np.ndarray, px_step: float = 2.0) -> np.ndarray:
+    """Insert intermediate samples along the first segment for visual smoothness."""
+    p = poly_xy
+    if p is None or len(p) < 2:
+        return p
+    dx, dy = p[1] - p[0]
+    L = np.hypot(dx, dy)
+    if L <= px_step:
+        return p
+    n = int(np.ceil(L / px_step))
+    ts = np.linspace(0, 1, n+1)[1:-1]
+    mids = p[0] + ts[:,None]*(p[1]-p[0])
+    return np.vstack([p[0], mids, p[1:]])
+
+def project_clip(poly_b_xyz: np.ndarray, T_cam_from_base, K, dist, H: int, W: int,
+                  smooth_first=True) -> np.ndarray:
+    """base→cam→image, then clip to bottom and (optionally) densify first segment. Returns [x,y] float."""
+    poly_b_xyz[:,2] = 0.0
+    poly_c = transform_points(T_cam_from_base, poly_b_xyz)       # (N,3)
+    pts_xy = project_points_cam(K, dist, poly_c)                 # (N,2) [x,y]
+    
+    if pts_xy.size == 0:
+        return pts_xy
+
+    # print(pts_xy)
+
+    pts_xy = clip_to_bottom_xy(pts_xy, H)
+
+    if smooth_first:
+        pts_xy = densify_first_segment_xy(pts_xy, px_step=2.0)
+
+    # clamp to bounds to be safe
+    pts_xy[:,0] = np.clip(pts_xy[:,0], 0, W-1)
+    pts_xy[:,1] = np.clip(pts_xy[:,1], 0, H-1)
+ 
+    return pts_xy
+
+def clean_2d(arr, W, H, max_jump_px=300):
+    # keep finite + in-bounds
+    arr = arr[np.isfinite(arr).all(axis=1)]
+    arr = arr[(arr[:,0]>=0)&(arr[:,0]<W)&(arr[:,1]>=0)&(arr[:,1]<H)]
+    if len(arr) < 2:
+        return arr
+    # cut at first large jump to avoid across-screen segments
+    jumps = np.linalg.norm(np.diff(arr,axis=0),axis=1)
+    bad = np.where(jumps < max_jump_px)
+    return arr if len(bad)==0 else arr[bad]
