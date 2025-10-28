@@ -51,6 +51,9 @@ def make_corridor_polygon(traj_b: np.ndarray,
     left_b  = np.stack([xL, yL, z], axis=1)
     right_b = np.stack([xR, yR, z], axis=1)
 
+    left_b = left_b[left_b[:, 0]>0]
+    right_b = right_b[right_b[:, 0]>0]
+
     if bridge_pts > 0:
         bx = np.linspace(xL[-1], xR[-1], bridge_pts)
         by = np.linspace(yL[-1], yR[-1], bridge_pts)
@@ -225,7 +228,7 @@ def clip_to_bottom_xy(poly_xy: np.ndarray, img_h: int) -> np.ndarray:
     if poly_xy is None or len(poly_xy) == 0:
         return poly_xy
     pts = poly_xy.astype(float, copy=True)
-    yb = float(img_h - 1)
+    yb = float(img_h - 2)
 
     # Already starts on the bottom row?
     if abs(pts[0,1] - yb) < 1e-6:
@@ -239,8 +242,9 @@ def clip_to_bottom_xy(poly_xy: np.ndarray, img_h: int) -> np.ndarray:
                 return pts[i:].copy()
             continue
         if (y0 - yb) * (y1 - yb) <= 0:  # spans scanline
+            # print(y0, y1, pts[i,0], pts[i+1,0])
             t = (yb - y0) / (y1 - y0)
-            t = max(0.0, min(1.0, t))
+            # t = max(0.0, min(1.0, t))
             x = pts[i,0] + t * (pts[i+1,0] - pts[i,0])
             inter = np.array([[x, yb]], dtype=float)
             return np.vstack([inter, pts[i+1:]])
@@ -282,8 +286,8 @@ def project_clip(poly_b_xyz: np.ndarray, T_cam_from_base, K, dist, H: int, W: in
 
     pts_xy = clip_to_bottom_xy(pts_xy, H)
 
-    if smooth_first:
-        pts_xy = densify_first_segment_xy(pts_xy, px_step=2.0)
+    # if smooth_first:
+    #     pts_xy = densify_first_segment_xy(pts_xy, px_step=2.0)
 
     # clamp to bounds to be safe
     pts_xy[:,0] = np.clip(pts_xy[:,0], 0, W-1)

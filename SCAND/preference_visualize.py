@@ -54,7 +54,7 @@ class PathItem:
 # ===========================
 # Main Annotator
 # ===========================
-class TemporalAnnotator:
+class PreferenceAnnotator:
     def __init__(self, bag_path, calib_path, topics_path, annotations_root, lookahead=5, num_keypoints=5, max_deviation=1.5):
         self.bag_path = bag_path
         self.bag_name = Path(bag_path).name
@@ -87,7 +87,7 @@ class TemporalAnnotator:
  
         self.bridge = CvBridge()
 
-        self.window = "SCAND Temporal Annotator"
+        self.window = "SCAND Preference Annotator"
         cv2.namedWindow(self.window, cv2.WINDOW_NORMAL)
 
         self.current_img = None
@@ -436,7 +436,7 @@ if __name__ == "__main__":
         
         print(f"[INFO] Processing {bp}")
         
-        annotator = TemporalAnnotator(bp, calib_path, topic_json_path, annotations_root, lookahead, num_keypoints, max_deviation)
+        annotator = PreferenceAnnotator(bp, calib_path, topic_json_path, annotations_root, lookahead, num_keypoints, max_deviation)
         annotator.process_bag(undersampling_factor)
 
     print(f"\n[DONE] Annotations written to {annotator.output_path}")

@@ -56,7 +56,7 @@ def make_offset_path_to_point(traj_b: np.ndarray,
     offset_signed = float(np.dot(point[:2] - traj_b[closest_idx, :2], n_goal))
 
     if extrapolate:
-        print("Extrapolating offset path...")
+        # print("Extrapolating offset path...")
         closest_idx = int(0.7*len(traj_b))
 
     cum_dists_goal = cum_dists[:closest_idx+1]

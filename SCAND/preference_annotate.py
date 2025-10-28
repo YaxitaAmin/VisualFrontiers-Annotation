@@ -29,8 +29,9 @@ from utils import get_topics_from_bag
 # Colors (BGR)
 COLOR_PATH_ONE = (0, 0, 255)    # RED
 COLOR_PATH_TWO = (0, 255, 0)    # GREEN
-COLOR_LAST = (0, 165, 255)  # ORANGE
-COLOR_CLICK = (255, 0, 0)   # BLUE
+
+BAD_BOTH = 500
+TIE_BOTH = 404
 
 # ===========================
 # Camera & Geometry helpers
@@ -97,6 +98,7 @@ class TemporalAnnotator:
         self.robot_width = topics.get(mode).get("width")
         self.lookahead = lookahead
         self.keypoint_res = lookahead/num_keypoints
+        self.v_mean = [1, 1, 1, 1, 1]
 
         print(f"[INFO] Using image topic: {self.image_topic}, control topic: {self.odom_topic}, robot width: {self.robot_width}")
  
@@ -126,9 +128,10 @@ class TemporalAnnotator:
 
         self.active_pairs = list(self.comp_pairs)
         self.active_pair_idx = 0
-        self._one_gt_two = None
         self.prefs_this_frame = []
         self._finalize_and_advance = False
+
+        self.first_frame = True
 
     def _get_timestamps_from_expert_annotations(self):
         timestamps = []
@@ -156,7 +159,7 @@ class TemporalAnnotator:
             return
         img = self.current_img.copy()
         img_h, img_w = img.shape[:2]
-
+        # print(img_h, img_w)
         # pick current pair; fallback to (0,1)
         if 0 <= self.active_pair_idx < len(self.active_pairs):
             i, j = self.active_pairs[self.active_pair_idx]
@@ -191,8 +194,8 @@ class TemporalAnnotator:
         if i < len(self.paths): draw_one(self.paths[i], COLOR_PATH_ONE)     # RED
         if j < len(self.paths): draw_one(self.paths[j], COLOR_PATH_TWO)     # GREEN
 
-        label = f"Compare ({i},{j})  [1]=RED  [2]=GREEN  ({self.active_pair_idx+1}/{len(self.active_pairs)})"
-        cv2.putText(img, label, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+        label = f"Compare ({i},{j})  [1]=RED  [2]=GREEN [3]=Both bad  [4]=No pref ({self.active_pair_idx+1}/{len(self.active_pairs)} Frame: {self.frame_idx}/{len(self.frames)})"
+        cv2.putText(img, label, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 3)
 
         self.current_img_show = img
         cv2.imshow(self.window, self.current_img_show)
@@ -210,7 +213,6 @@ class TemporalAnnotator:
     def reset(self):
         self.paths = []
         self.prefs_this_frame = []
-        self._one_gt_two = None
         self._finalize_and_advance = False
         self.active_pairs = list(self.comp_pairs)  # phase 1 again
         self.active_pair_idx = 0
@@ -221,14 +223,7 @@ class TemporalAnnotator:
         stamp_key = str(self.frame_stamp)
 
         paths_dict = {}
-        for idx, pitem in enumerate(self.paths[:5]):  # ensure 0..4 exist
-            if self._one_gt_two:
-                if idx == 4:
-                    continue
-            elif not self._one_gt_two:
-                if idx == 3:
-                    continue
-
+        for idx, pitem in enumerate(self.paths[:4]):  # ensure 0..4 exist
             paths_dict[str(idx)] = self._path_item_to_dict(pitem, self.frame_stamp)
 
         ranking = self._compute_ranking()
@@ -266,13 +261,22 @@ class TemporalAnnotator:
         return cv_img
 
     def _compute_ranking(self):
-        # participating indices:
-        idxs = [0,1,2,3] if self._one_gt_two else [0,1,2,4]
-        wins = {k:0 for k in idxs}
+        n = min(len(self.paths), 4)     # you build 4
+        idxs = list(range(n))
+        wins = {k: 0 for k in idxs}
         for e in self.prefs_this_frame:
             i, j = e["pair"]; c = e["choice"]
             if i in wins and j in wins and c in wins:
                 wins[c] += 1
+            if c == BAD_BOTH:
+                # both bad
+                wins[i] -= 1
+                wins[j] -= 1
+            if c == TIE_BOTH:
+                # no pref
+                wins[i] += 0.5
+                wins[j] += 0.5
+
         order = sorted(idxs, key=lambda k: (-wins[k], k))  # tie -> lower index
         return order
     
@@ -280,10 +284,12 @@ class TemporalAnnotator:
         if self.active_pair_idx < 0 or self.active_pair_idx >= len(self.active_pairs):
             return
         pair = self.active_pairs[self.active_pair_idx]
-        self.prefs_this_frame.append({"pair": [int(pair[0]), int(pair[1])], "choice": int(chosen_idx)})
-
-        if set(pair) == {1, 2}:
-            self._one_gt_two = (chosen_idx == 1)
+        
+        self.prefs_this_frame.append({
+            "pair": [int(pair[0]), int(pair[1])], 
+            "choice": int(chosen_idx),
+            "meaning": "both_bad" if chosen_idx == BAD_BOTH else ("no_preference" if chosen_idx == TIE_BOTH else "picked_index")
+            })
 
         self.active_pair_idx += 1
 
@@ -395,12 +401,20 @@ class TemporalAnnotator:
     def dynamic_lookahead(self, v: float, w: float,
                       T: float = 4.0,           # time headway [s]
                       a_brake: float = 2.5,      # comfortable decel [m/s^2]
-                      L_min: float = 1.0,        # never smaller than this [m]
+                      L_min: float = 2.0,        # never smaller than this [m]
                       L_max: float = 8.0,       # never larger than this [m]
                       kappa_gain: float = 2.0,   # how much to shrink on curves
                       eps: float = 1e-3) -> float:
         """Return meters of lookahead based on speed & curvature."""
+
+        if self.first_frame:
+            self.first_frame = False
+            self.v_mean = [v, v, v, v, v]
+
         v = max(0.0, v)                              # ignore reverse for now
+        self.v_mean.pop(0)
+        self.v_mean.append(v)
+        v = sum(self.v_mean)/len(self.v_mean)
         L_time  = v * T
         L_stop  = (v * v) / (2.0 * max(a_brake, 1e-6))
         L_base  = max(L_time, L_stop, L_min)
@@ -417,13 +431,15 @@ class TemporalAnnotator:
         
         # print(self.timestamps[:10])
         count = 0
+        skip_count = 0
         timestamp_counter = 0
         with rosbag.Bag(self.bag_path, "r") as bag:
             pos_defined = False
             for i, (topic, msg, t) in enumerate(bag.read_messages(topics=[self.image_topic, self.odom_topic])):
-                # print(int(str(t)), int(self.timestamps[timestamp_counter]))
-                # if(int(str(t)) > int(self.timestamps[timestamp_counter])):
-                #     break
+                # print(int(str(t)), int(self.timestamps[timestamp_counter]), timestamp_counter, len(self.timestamps))
+                if(int(str(t)) > int(self.timestamps[timestamp_counter]) and not pos_defined):
+                    timestamp_counter += 1
+                    skip_count += 1
                 if topic == self.odom_topic:
                     pos, v, w, rot, yaw = self.process_odom(msg)
                     pos_defined = True
@@ -436,7 +452,7 @@ class TemporalAnnotator:
                         count+=1       
                 if timestamp_counter >= len(self.timestamps):
                     break 
-
+        print(f"[INFO] Loaded {len(self.frames)} frames from bag after skipping {skip_count} frames.")
         if not self.frames:
             print("[WARN] No frames after undersampling.")
             return
@@ -483,6 +499,14 @@ class TemporalAnnotator:
                         cur = self.active_pairs[self.active_pair_idx] if self.active_pair_idx < len(self.active_pairs) else None
                         if cur is not None:
                             self._record_choice(cur[1])
+                    elif key == ord('3'):
+                        cur = self.active_pairs[self.active_pair_idx] if self.active_pair_idx < len(self.active_pairs) else None
+                        if cur is not None:
+                            self._record_choice(BAD_BOTH)
+                    elif key == ord('4'):
+                        cur = self.active_pairs[self.active_pair_idx] if self.active_pair_idx < len(self.active_pairs) else None
+                        if cur is not None:
+                            self._record_choice(TIE_BOTH)
 
                     elif key == 81:  # Left Arrow → go back one (no save)
                         print("[INFO] Back one frame.")
@@ -513,10 +537,6 @@ if __name__ == "__main__":
     topic_json_path = "./topics_for_project.json"
 
     fx, fy, cx, cy = 640.0, 637.0, 640.0, 360.0                   #  SCAND Kinect intrinsics ### DO NOT CHANGE
-    T_horizon = 2.0      # Path generation options
-    num_t_samples = 1000
-    robot_width_min = 0.35
-    robot_width_max = 0.7
     undersampling_factor = 6
     lookahead = 7 #in m if the lookahead is distance , in s if the lookahead is time. 
     num_keypoints = 5
