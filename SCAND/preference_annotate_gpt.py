@@ -29,7 +29,6 @@ from utils import get_topics_from_bag
 # Colors (BGR)
 COLOR_PATH_ONE = (0, 0, 255)    # RED
 COLOR_PATH_TWO = (0, 255, 0)    # GREEN
-CLOSER_COLOR = (0, 255, 255)    # YELLOW
 
 BAD_BOTH = 500
 TIE_BOTH = 404
@@ -134,8 +133,6 @@ class TemporalAnnotator:
         self._finalize_and_advance = False
 
         self.first_frame = True
-        self.annotator_goal = None
-        self.initial_choice = None
 
     def _get_timestamps_from_expert_annotations(self):
         timestamps = []
@@ -179,20 +176,9 @@ class TemporalAnnotator:
                 return (i, j)
             else:
                 return (j, i)
-        
-        def check_closer_to_goal_direction(pitem_1: PathItem, pitem_2: PathItem) -> Tuple[int, int]:
-            # Determine which path is closer to the annotator goal
-            if self.annotator_goal is None:
-                True
-            p1_last = pitem_1.path_points[-1][1]
-            p2_last = pitem_2.path_points[-1][1]
-
-            dist_1 = np.linalg.norm(p1_last - self.annotator_goal[1])
-            dist_2 = np.linalg.norm(p2_last - self.annotator_goal[1])
-
-            return dist_1<dist_2
             
-        def draw_one(pitem, color, closer):
+
+        def draw_one(pitem, color):
             points_2d = clean_2d(project_clip(pitem.path_points, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True), img_w, img_h)
             left_2d   = clean_2d(project_clip(pitem.left_boundary,  self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True), img_w, img_h)
             right_2d  = clean_2d(project_clip(pitem.right_boundary, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True), img_w, img_h)
@@ -201,31 +187,19 @@ class TemporalAnnotator:
             # right_2d  = project_clip(pitem.right_boundary, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True)
             poly_2d   = make_corridor_polygon_from_cam_lines(left_2d, right_2d)
             draw_polyline(img, points_2d, 2, color)
-
-            if closer:
-                draw_corridor(img, poly_2d, left_2d, right_2d, fill_alpha=0.35, fill_color=color, edge_color=CLOSER_COLOR, edge_thickness=2)
-            else:
-                draw_corridor(img, poly_2d, left_2d, right_2d, fill_alpha=0.15, fill_color=color, edge_color=color, edge_thickness=2)
+            draw_corridor(img, poly_2d, left_2d, right_2d, fill_alpha=0.35, fill_color=color, edge_color=color, edge_thickness=2)
 
         i, j = check_left_right(self.paths[i], self.paths[j])
-        closer_1 = check_closer_to_goal_direction(self.paths[i], self.paths[j])
-        closer_2 = not closer_1
-
         self.active_pairs[self.active_pair_idx] = (i, j)
         
-        if i < len(self.paths): draw_one(self.paths[i], COLOR_PATH_ONE, closer_1)     # RED
-        if j < len(self.paths): draw_one(self.paths[j], COLOR_PATH_TWO, closer_2)     # GREEN
+        if i < len(self.paths): draw_one(self.paths[i], COLOR_PATH_ONE)     # RED
+        if j < len(self.paths): draw_one(self.paths[j], COLOR_PATH_TWO)     # GREEN
 
         label = f"Compare ({i},{j})  [1]=RED  [2]=GREEN [3]=Both bad  [4]=No pref ({self.active_pair_idx+1}/{len(self.active_pairs)} Frame: {self.frame_idx}/{len(self.frames)})"
         cv2.putText(img, label, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 3)
 
         self.current_img_show = img
         cv2.imshow(self.window, self.current_img_show)
-
-        if closer_1:
-            self.initial_choice = 0
-        elif closer_2:
-            self.initial_choice = 1
         
     def _path_item_to_dict(self, pitem: PathItem, stamp_obj):
         # stamp as a string for readability; also give a per-point parallel stamp list if you want
@@ -358,8 +332,8 @@ class TemporalAnnotator:
         if annotator_goal is None:
             raise Exception
 
-        self.annotator_goal = np.array([annotator_goal['x'], annotator_goal['y'], annotator_goal['z']])        
-        expert_path = make_offset_path_to_point(self.path, self.yaws, self.annotator_goal, self.cum_dists)
+        annotator_goal = np.array([annotator_goal['x'], annotator_goal['y'], annotator_goal['z']])        
+        expert_path = make_offset_path_to_point(self.path, self.yaws, annotator_goal, self.cum_dists)
 
 
         return left_offset_path, right_offset_path, expert_path
@@ -382,13 +356,13 @@ class TemporalAnnotator:
         if self.first_frame:
             self.lookahead = self.dynamic_lookahead(v, w)
             self.lookaheads = [self.lookahead, self.lookahead, self.lookahead, self.lookahead, self.lookahead, self.lookahead, self.lookahead, self.lookahead, self.lookahead, self.lookahead]
-            self.first_frame = False
+            
         else:
             self.lookahead = self.dynamic_lookahead(v, w)
             self.lookaheads.pop(0)
             self.lookaheads.append(self.lookahead)
 
-        self.lookahead = sorted(self.lookaheads)[len(self.lookaheads)//2]
+        self.lookahead = sum(self.lookaheads)/len(self.lookaheads)
 
         path = [current_pos]
         yaws = [current_yaw]
@@ -450,7 +424,7 @@ class TemporalAnnotator:
         v = max(0.0, v)                              # ignore reverse for now
         self.v_mean.pop(0)
         self.v_mean.append(v)
-        v = sorted(self.v_mean)[len(self.v_mean)//2]
+        v = sum(self.v_mean)/len(self.v_mean)
         L_time  = v * T
         L_stop  = (v * v) / (2.0 * max(a_brake, 1e-6))
         L_base  = max(L_time, L_stop, L_min)
@@ -543,9 +517,6 @@ class TemporalAnnotator:
                         cur = self.active_pairs[self.active_pair_idx] if self.active_pair_idx < len(self.active_pairs) else None
                         if cur is not None:
                             self._record_choice(TIE_BOTH)
-                    elif key == 83: # Right Arrow → finalize & go to next
-                        cur = self.active_pairs[self.active_pair_idx] if self.active_pair_idx < len(self.active_pairs) else None
-                        self._record_choice(cur[self.initial_choice])
 
                     elif key == 81:  # Left Arrow → go back one (no save)
                         print("[INFO] Back one frame.")
