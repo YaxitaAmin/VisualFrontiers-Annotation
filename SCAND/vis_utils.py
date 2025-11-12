@@ -295,13 +295,33 @@ def project_clip(poly_b_xyz: np.ndarray, T_cam_from_base, K, dist, H: int, W: in
  
     return pts_xy
 
-def clean_2d(arr, W, H, max_jump_px=300):
-    # keep finite + in-bounds
-    arr = arr[np.isfinite(arr).all(axis=1)]
-    arr = arr[(arr[:,0]>=0)&(arr[:,0]<W)&(arr[:,1]>=0)&(arr[:,1]<H)]
+
+def clean_2d(arr, W, H, max_jump_px=500):
+    if len(arr) == 0:
+        return arr
+    
+    # keep finite + in-bounds (with small margin)
+    valid = np.isfinite(arr).all(axis=1)
+    valid &= (arr[:,0] >= -10) & (arr[:,0] < W + 10)
+    valid &= (arr[:,1] >= -10) & (arr[:,1] < H + 10)
+    arr = arr[valid]
+    
     if len(arr) < 2:
         return arr
+    
     # cut at first large jump to avoid across-screen segments
-    jumps = np.linalg.norm(np.diff(arr,axis=0),axis=1)
-    bad = np.where(jumps < max_jump_px)
-    return arr if len(bad)==0 else arr[bad]
+    jumps = np.linalg.norm(np.diff(arr, axis=0), axis=1)
+    bad_idx = np.where(jumps > max_jump_px)[0]  # Changed < to >
+    
+    if len(bad_idx) == 0:
+        return arr
+    
+    # Keep points up to first bad jump
+    first_bad = bad_idx[0]
+    result = arr[:first_bad + 1]
+    
+    # Ensure minimum 2 points
+    if len(result) < 2 and len(arr) >= 2:
+        return arr[:2]
+    
+    return result
