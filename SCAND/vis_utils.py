@@ -295,7 +295,7 @@ def project_clip(poly_b_xyz: np.ndarray, T_cam_from_base, K, dist, H: int, W: in
  
     return pts_xy
 
-
+#changed
 def clean_2d(arr, W, H, max_jump_px=500):
     if len(arr) == 0:
         return arr
