@@ -364,7 +364,7 @@ if __name__ == "__main__":
     # ===========================
 
     bag_dir = "/media/beast-gamma/Media/Datasets/SCAND/annt"   # Point to path with rosbags being annotated for the day
-    annotations_root = "./Annotations"
+    annotations_root = "./Annotations_closest"
     calib_path = "./tf.json"
     skip_json_path = "./bags_to_skip.json"
     topic_json_path = "./topics_for_project.json"

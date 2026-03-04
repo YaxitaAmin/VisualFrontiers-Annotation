@@ -26,7 +26,7 @@ from traj_utils import solve_arc_from_point, arc_to_traj
 # ===========================
 
 bag_dir = "/media/beast-gamma/Media/Datasets/SCAND/annt"   # Point to path with rosbags being annotated for the day
-annotations_root = "./Annotations"
+annotations_root = "./ActionAnnotations"
 calib_path = "./tf.json"
 skip_json_path = "./bags_to_skip.json"
 
@@ -215,6 +215,7 @@ class Annotator:
         if self.bag_doc is None:
             raise RuntimeError("bag doc not open")
         if not (self.last_click_uv and self.last_target_base and self.last_selection_record):
+            self.log_stop()
             return
         
         u, v = self.last_click_uv
@@ -286,7 +287,8 @@ class Annotator:
                 # Convert ROS Image -> BGR
                 cv_img = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
                 self.frames.append(FrameItem(idx=i, stamp=t, img=cv_img))
-
+        
+        print(f"[INFO] Loaded {len(self.frames)} frames from bag after undersampling.")
         if not self.frames:
             print("[WARN] No frames after undersampling.")
             return

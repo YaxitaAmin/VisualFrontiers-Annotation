@@ -66,6 +66,14 @@ def make_corridor_polygon_from_cam_lines(left_c: np.ndarray,
                           right_c: np.ndarray, 
                           bridge_pts: int = 15) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
+    # If either side is empty, return empty polygon
+    if left_c.shape[0] == 0 or right_c.shape[0] == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    # Optional: if one side is too short, also bail
+    if left_c.shape[0] < 2 or right_c.shape[0] < 2:
+        return np.empty((0, 2), dtype=np.float32)
+    
     if bridge_pts > 0:
         bx = np.linspace(left_c[-1][0], right_c[-1][0], bridge_pts)
         by = np.linspace(left_c[-1][1], right_c[-1][1], bridge_pts)
@@ -120,6 +128,18 @@ def draw_corridor(img: np.ndarray, poly_2d: np.ndarray, left_2d: np.ndarray, rig
 
 def project_points_cam(K: np.ndarray, dist, P_cam: np.ndarray) -> np.ndarray:
     """Project Nx3 camera-frame points to pixels. No distortion if dist is None."""
+    if P_cam is None:
+        return np.empty((0, 2), dtype=np.float32)
+    P_cam = np.asarray(P_cam, dtype=np.float64).reshape(-1, 3)
+    if P_cam.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
+
+    # Drop non-finite rows to avoid cv2 errors
+    finite_mask = np.all(np.isfinite(P_cam), axis=1)
+    P_cam = P_cam[finite_mask]
+    if P_cam.size == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    
     rvec = np.zeros((3, 1), dtype=np.float64)
     tvec = np.zeros((3, 1), dtype=np.float64)
     pts2d, _ = cv2.projectPoints(P_cam.astype(np.float64), rvec, tvec, K, None)

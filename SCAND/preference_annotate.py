@@ -66,10 +66,10 @@ class TemporalAnnotator:
         self.needs_correction = False
         stem = Path(self.bag_name).stem
         self.output_path = os.path.join(annotations_root, f"{stem}.json")
-
+        fx, fy, cx, cy = 640.0, 637.0, 640.0, 360.0
 
         self.expert_action_annotation_dir = os.path.join(expert_action_annotation_dir, self.bag_name.replace(".bag", ".json"))
-
+        print(f"[INFO] Expert action annotations path: {self.expert_action_annotation_dir}")
         with open(topics_path, 'r') as f:
             topics = json.load(f)
         
@@ -101,6 +101,8 @@ class TemporalAnnotator:
         self.lookaheads = [lookahead, lookahead, lookahead, lookahead, lookahead, lookahead, lookahead, lookahead, lookahead, lookahead]
         self.keypoint_res = lookahead/num_keypoints
         self.v_mean = [1, 1, 1, 1, 1]
+        self.max_duration = 2.4
+        self.L_max = 8.0
 
         print(f"[INFO] Using image topic: {self.image_topic}, control topic: {self.odom_topic}, robot width: {self.robot_width}")
  
@@ -136,6 +138,11 @@ class TemporalAnnotator:
         self.first_frame = True
         self.annotator_goal = None
         self.initial_choice = None
+        self.timed_exit = False
+        self.stop = False
+
+        self.current_pos = None
+        self.current_yaw = None
 
     def _get_timestamps_from_expert_annotations(self):
         timestamps = []
@@ -260,7 +267,10 @@ class TemporalAnnotator:
             "robot_width": self.robot_width,
             "paths": paths_dict,
             "preference": ranking,
-            "pairwise": self.prefs_this_frame
+            "pairwise": self.prefs_this_frame, 
+            "position": self.current_pos,
+            "yaw" : self.current_yaw,
+            "stop": self.stop
         }
 
     def process_odom(self, msg):
@@ -276,7 +286,7 @@ class TemporalAnnotator:
         else:
             v = msg.twist.twist.linear.x
         
-        yaw = msg.pose.pose.orientation.z
+        yaw = np.arctan2(rotation_matrix[1,0], rotation_matrix[0,0])
         pos = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z])
         w = msg.twist.twist.angular.z
 
@@ -334,9 +344,9 @@ class TemporalAnnotator:
         return PathItem(path_points=path_points, left_boundary=left_b, right_boundary=right_b, polygon=poly_b)
 
     def compute_comparison_paths(self):
-
-        offset = np.random.uniform(self.robot_width/2, self.max_deviation)
-        if self.cum_dists[-1] == 0:
+        max_offset = max(self.max_deviation * self.cum_dists[-1]/self.L_max, self.robot_width)
+        offset = np.random.uniform(self.robot_width/2, max_offset)
+        if self.cum_dists[-1] == 0 or self.path is None or self.path.shape[0] < 2:
             return np.array([[0, 0, 0]]), np.array([[0, 0, 0]]), np.array([[0, 0, 0]]), np.array([[0, 0, 0]])
 
         offset_ratios = self.cum_dists / self.cum_dists[-1]
@@ -353,15 +363,22 @@ class TemporalAnnotator:
 
         # # print(conv_offsets)
         # left_conv_path, right_conv_path = make_offset_paths(self.path, self.yaws, conv_offsets)
-        annotator_goal = self.action_annotations.get("annotations_by_stamp", {}).get(str(self.frame_stamp), {}).get("goal_base", None)
 
-        if annotator_goal is None:
-            raise Exception
+        stop_flag = self.action_annotations.get("annotations_by_stamp", {}).get(str(self.frame_stamp), {}).get("stop", False)
 
-        self.annotator_goal = np.array([annotator_goal['x'], annotator_goal['y'], annotator_goal['z']])        
-        expert_path = make_offset_path_to_point(self.path, self.yaws, self.annotator_goal, self.cum_dists)
+        if not stop_flag:
+            annotator_goal = self.action_annotations.get("annotations_by_stamp", {}).get(str(self.frame_stamp), {}).get("goal_base", None)
 
+            if annotator_goal is None:
+                raise Exception
 
+            self.annotator_goal = np.array([annotator_goal['x'], annotator_goal['y'], annotator_goal['z']])
+            expert_path = make_offset_path_to_point(self.path, self.yaws, self.annotator_goal, self.cum_dists)
+            self.stop = False
+        else:
+            # print("HMm")
+            expert_path = np.zeros((10,3), dtype=np.float32)
+            self.stop = True
         return left_offset_path, right_offset_path, expert_path
     
     def compute_path(self):
@@ -393,6 +410,7 @@ class TemporalAnnotator:
         path = [current_pos]
         yaws = [current_yaw]
         cum_dists = [0]
+        t1 = self.frames[self.frame_idx].stamp
         while True:
 
             # print(arc_length, self.lookahead)11
@@ -406,9 +424,10 @@ class TemporalAnnotator:
 
             distance = np.linalg.norm(diff)
             arc_length += distance
-
+            t2 = self.frames[frame_pointer].stamp
             # print(distance)
-            if arc_length > self.lookahead:
+            # print((t2 - t1).to_sec())
+            if arc_length > self.lookahead or (float((t2 - t1).to_sec()) > self.max_duration and self.timed_exit):
                 break
             elif arc_length > (keypoint_count+1)*self.keypoint_res:
                 keypoint_count+=1
@@ -497,7 +516,7 @@ class TemporalAnnotator:
         try:
             while 0 <= i < len(self.frames):
                 fr = self.frames[i]
-                self.frame_idx = fr.idx
+                self.frame_idx = i
                 self.frame_stamp = fr.stamp
                 self.current_img = fr.img
                 self.reset()

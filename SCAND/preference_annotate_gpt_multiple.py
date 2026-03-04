@@ -19,40 +19,50 @@ from preference_annotate import TemporalAnnotator, FrameItem, PathItem
 from openai import OpenAI
 import base64
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 # Colors (BGR) — swap out red/green
 COLOR_PATH_ONE = (178, 114, 0)   # Blue  #0072B2
 COLOR_PATH_TWO = (0, 159, 230)   # Orange #E69F00
 
+# COLOR_PATH_ONE = (0, 0, 255)   # Red
+# COLOR_PATH_TWO = (0, 0, 255)   # Red
+
 EDGE_COLOR_ONE = (130, 80, 0)
 EDGE_COLOR_TWO = (0, 120, 180)
+
+# EDGE_COLOR_ONE = (0, 0, 255)
+# EDGE_COLOR_TWO = (0, 0, 255)
+
 FILL_ALPHA = 0.35
 
 BAD_BOTH = 500
 TIE_BOTH = 404
 
 PROMPT_SYSTEM = """You are an expert human-preference annotator for mobile robot navigation.
-You will see an image with two overlaid paths. 
-The path towards the left of the image is **BLUE (1)** and the path towards the right is **ORANGE (2)**.
-
-Choose the safer and more socially appropriate path for the robot to follow.
-Color is only an identifier — do NOT prefer any color or side by default.
+You will see an image with two overlaid paths.
+Each path has an associated number on the image: 1 on BLUE (left), 2 on ORANGE (right).
+Color, number and side are only identifiers — do NOT prefer any color or side by default.
 
 Prioritize, in order:
 1. Safety — avoid pedestrians, obstacles, or collisions; aim ≥0.6 m clearance.
-2. Viability — stay on walkable ground; avoid off-limits or unreachable regions.
+2. Viability — stay on walkable regions; avoid off-limits or unreachable regions.
 3. Social compliance — do not cut through groups or disrupt natural flow.
 
 Center bias:
-- Prefer staying centered in the chosen corridor.
-- Do NOT deviate from the middle unless an obstacle is inside the corridor **now** 
-  or is likely to **enter the corridor within ~2 s** based on its motion.
-- Ignore obstacles that are clearly **outside** the corridor boundaries or **far ahead** (>8 m) 
-  unless they are moving **into** the corridor soon.
+- Prefer staying centered in the navigable area and navigating along the current field of view.
+- Do NOT deviate from the middle unless an obstacle is inside the path boundaries NOW
+  or is likely to ENTER the path within ~2 s based on its motion.
+- Ignore obstacles clearly OUTSIDE the path boundaries or FAR AHEAD (>8 m) unless moving into it soon.
+
+Obstacle-heading rule:
+- DOWN-RANK any path that trends directly toward an obstacle (e.g., person, wall, barrier)
+  that lies inside the path boundaries within the near range or at the path's end.
 
 Decision rule:
-- Pick **1** if the BLUE path is better, **2** if the ORANGE path is better.
-- **500** (both bad): both paths clearly unsafe or not viable.
-- **404** (no preference): one or both paths are not visible or effectively identical.
+- Pick 1 if the BLUE path (which is marked as 1) is better, 2 if the ORANGE path (which is marked as 2) is better.
+- 500 (both bad): both paths clearly lead to collisions, obstacles, or off-limits areas.
+- 404 (no preference): one or both paths are not visible or effectively identical.
 
 Return ONLY this JSON:
 {
@@ -60,8 +70,46 @@ Return ONLY this JSON:
   "reason": "<=10 words>",
   "scores": { "safety": 0-10, "clearance": 0-10, "walkable": 0-10 }
 }
-Do not include anything outside the JSON."""
+Do not include anything outside the JSON.
 
+For example if path 1 is heading towards an obstacle and path 2 is heading towards a clear area you would respond with: {"choice": 2, "reason": "Path 2 is clear", "scores": {"safety": 8, "clearance": 9, "walkable": 10}}
+For example if both paths are heading towards obstacles you would respond with: {"choice": 500, "reason": "Both paths unsafe", "scores": {"safety": 2, "clearance": 3, "walkable": 4}}
+For example if both paths are identical you would respond with: {"choice": 404, "reason": "Paths identical", "scores": {"safety": 7, "clearance": 7, "walkable": 7}}
+"""
+
+# PROMPT_SYSTEM = """You are an expert human-preference annotator for mobile robot navigation.
+# You will see an image with two overlaid paths.
+# Each path has an associated number on the image: 1 or 2. Your task is to pick the better path.
+
+# Prioritize, in order:
+# 1. Safety — avoid pedestrians, obstacles, or collisions; aim ≥0.6 m clearance.
+# 2. Viability — stay on walkable regions; avoid off-limits or unreachable regions.
+# 3. Social compliance — do not cut through groups or disrupt natural flow.
+
+# Center bias:
+# - Prefer staying centered in the navigable area and navigating along the current field of view.
+# - Do NOT deviate from the middle unless an obstacle is inside the path boundaries NOW
+#   or is likely to ENTER the path within ~2 s based on its motion.
+# - Ignore obstacles clearly OUTSIDE the path boundaries or FAR AHEAD (>8 m) unless moving into it soon.
+
+# Obstacle-heading rule:
+# - DOWN-RANK any path that trends directly toward an obstacle (e.g., person, wall, barrier)
+#   that lies inside the path boundaries within the near range or at the path's end.
+
+# Decision rule:
+# - 500 (both bad): both paths clearly lead to collisions, obstacles, or off-limits areas.
+# - 404 (no preference): one or both paths are not visible or effectively identical.
+
+# Return ONLY this JSON:
+# {
+#   "choice": 1 | 2 | 500 | 404,
+#   "reason": "<=10 words>",
+#   "scores": { "safety": 0-10, "clearance": 0-10, "walkable": 0-10 }
+# }
+# Do not include anything outside the JSON.
+
+
+# """
 
 class GPTModelClient:
     def __init__(self, model_name: str = "gpt-5-mini"):
@@ -99,12 +147,12 @@ class GPTModelClient:
     def build_user_prompt(self, frame_idx: int) -> str:
         return (
             "Task: Compare two candidate paths overlaid on the image and return the JSON.\n"
-            "Legend: RED=1, GREEN=2. Use the rules from the system message.\n"
+            "Use the rules from the system message to pick the better path (1 or 2).\n"
             f'Frame info: {{"frame_idx": {frame_idx}}}'
         )
 
 class TemporalAnnotatorGPT(TemporalAnnotator):
-    def __init__(self, bag_path, calib_path, topics_path, annotations_root, expert_action_annotation_dir, lookahead=5, num_keypoints=5, max_deviation=1.5, preview_mode=True, preview_stride=10, preview_wait_ms=1):
+    def __init__(self, bag_path, calib_path, topics_path, annotations_root, expert_action_annotation_dir, lookahead=5, num_keypoints=5, max_deviation=1.5, preview_mode=False, preview_stride=10, preview_wait_ms=1):
         super().__init__(bag_path, calib_path, topics_path, annotations_root, expert_action_annotation_dir, lookahead, num_keypoints, max_deviation)
         self.gpt = GPTModelClient()
         self.preview_mode = preview_mode
@@ -117,8 +165,36 @@ class TemporalAnnotatorGPT(TemporalAnnotator):
             timestamps.append(int(key))
         return timestamps
 
+    def _pair_left_right_indices(self, pair) -> Tuple[int, int]:
+        """Return (left_idx, right_idx) for the two path indices in `pair`,
+        based on image-plane x positions of projected polylines.
+        Falls back to world-frame lateral check if projection fails."""
+        i, j = pair
+        img_h, img_w = self.current_img.shape[:2]
+
+        def median_x(pitem: PathItem):
+            pts_2d = clean_2d(project_clip(
+                pitem.path_points, self.T_cam_from_base, self.K, self.dist,
+                img_h, img_w, smooth_first=True
+            ), img_w, img_h)
+            if pts_2d.shape[0] == 0:
+                return None
+            # use median x to be robust to partial visibility
+            return float(np.median(pts_2d[:, 0]))
+
+        xi = median_x(self.paths[i])
+        xj = median_x(self.paths[j])
+
+        if xi is not None and xj is not None:
+            return (i, j) if xi <= xj else (j, i)
+
+        # Fallback: world-frame lateral (y) of last point in robot/base frame
+        pi = self.paths[i].path_points[-1]
+        pj = self.paths[j].path_points[-1]
+        return (i, j) if pi[1] <= pj[1] else (j, i)
+    
     def _draw_circle_badge(self, img, center_xy, text, radius=16,
-                    bg=(30,30,30), fg=(255,255,255), ring=(255,255,255)):
+                       bg=(30,30,30), fg=(255,255,255), ring=(255,255,255)):
         """Draw a circular badge with a thin white ring and centered text."""
         x, y = center_xy
         cv2.circle(img, (x, y), radius+2, ring, thickness=2, lineType=cv2.LINE_AA)
@@ -128,41 +204,26 @@ class TemporalAnnotatorGPT(TemporalAnnotator):
         (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
         tx, ty = int(x - tw/2), int(y + th/2 - 2)
         cv2.putText(img, text, (tx, ty), font, scale, fg, thickness, cv2.LINE_AA)
-        
-    def draw(self, show_window: bool = False):
-        if self.current_img is None or not self.paths:
-            return
+
+
+    def render_pair_image(self, pair):
+        if self.current_img is None:
+            return None
         img = self.current_img.copy()
         img_h, img_w = img.shape[:2]
 
-        # pick current pair; fallback to (0,1)
-        if 0 <= self.active_pair_idx < len(self.active_pairs):
-            i, j = self.active_pairs[self.active_pair_idx]
-        else:
-            i, j = (0, 1)
+        left_idx, right_idx = self._pair_left_right_indices(pair)
 
-        def check_left_right(pitem_1: PathItem, pitem_2: PathItem) -> Tuple[int, int]:
-            # Determine which path is left/right based on the first point
-            p1_last = pitem_1.path_points[-1]
-            p2_last = pitem_2.path_points[-1]
-
-            if p1_last[1] > p2_last[1]:
-                return (i, j)
-            else:
-                return (j, i)
-            
-
-        def draw_one(pitem, color):
+        def draw_one(pitem, color, edge_color):
             points_2d = clean_2d(project_clip(pitem.path_points, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True), img_w, img_h)
             left_2d   = clean_2d(project_clip(pitem.left_boundary,  self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True), img_w, img_h)
             right_2d  = clean_2d(project_clip(pitem.right_boundary, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True), img_w, img_h)
             poly_2d   = make_corridor_polygon_from_cam_lines(left_2d, right_2d)
             draw_polyline(img, points_2d, 2, color)
             draw_corridor(img, poly_2d, left_2d, right_2d,
-              fill_alpha=FILL_ALPHA, fill_color=color,
-              edge_color=EDGE_COLOR_ONE if color==COLOR_PATH_ONE else EDGE_COLOR_TWO,
-              edge_thickness=2)
-    
+                        fill_alpha=FILL_ALPHA, fill_color=color,
+                        edge_color=edge_color, edge_thickness=2)
+            
         def _end_xy(pitem):
             pts_2d = clean_2d(project_clip(
                 pitem.path_points, self.T_cam_from_base, self.K, self.dist, img_h, img_w, smooth_first=True
@@ -173,35 +234,26 @@ class TemporalAnnotatorGPT(TemporalAnnotator):
             x, y = pts_2d[-1, 0], max(0, pts_2d[-1, 1] - 12)
             return (int(x), int(y))
 
-        i, j = check_left_right(self.paths[i], self.paths[j])
-        self.active_pairs[self.active_pair_idx] = (i, j)
-        
-        if i < len(self.paths): draw_one(self.paths[i], COLOR_PATH_ONE)     # RED
-        if j < len(self.paths): draw_one(self.paths[j], COLOR_PATH_TWO)     # GREEN
-
-        label = f"Compare ({i},{j})  [1]=RED  [2]=GREEN [3]=Both bad  [4]=No pref ({self.active_pair_idx+1}/{len(self.active_pairs)} Frame: {self.frame_idx}/{len(self.frames)})"
-        cv2.putText(img, label, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 3)
+        # BLUE(1) must be the LEFT one; ORANGE(2) the RIGHT one
+        draw_one(self.paths[left_idx],  COLOR_PATH_ONE, EDGE_COLOR_ONE)
+        draw_one(self.paths[right_idx], COLOR_PATH_TWO, EDGE_COLOR_TWO)
 
         # BLUE/left badge "1"
-        pL = _end_xy(self.paths[i])
+        pL = _end_xy(self.paths[left_idx])
         if pL is not None:
             self._draw_circle_badge(img, pL, "1", fg=(255,255,255), bg=(40,80,160))
 
         # ORANGE/right badge "2"
-        pR = _end_xy(self.paths[j])
+        pR = _end_xy(self.paths[right_idx])
         if pR is not None:
             self._draw_circle_badge(img, pR, "2", fg=(255,255,255), bg=(20,120,200))
 
-        self.current_img_show = img
+        return img
 
-        if show_window:
-            cv2.imshow(self.window, self.current_img_show)
-            cv2.waitKey(self.preview_wait_ms)
-
-    def _record_choice(self, chosen_idx: int, meta: Optional[dict] = None):
+    def _record_choice(self, pair, chosen_idx: int, meta: Optional[dict] = None):
         if self.active_pair_idx < 0 or self.active_pair_idx >= len(self.active_pairs):
             return
-        pair = self.active_pairs[self.active_pair_idx]
+
         entry = {
             "pair": [int(pair[0]), int(pair[1])],
             "choice": int(chosen_idx),
@@ -247,6 +299,7 @@ class TemporalAnnotatorGPT(TemporalAnnotator):
         i = 0
         try:
             while 0 <= i < len(self.frames):
+                print(f"[INFO] Processing frame {i+1}/{len(self.frames)} (idx={self.frames[i].idx})")
                 fr = self.frames[i]
                 self.frame_idx = fr.idx
                 self.frame_stamp = fr.stamp
@@ -269,35 +322,30 @@ class TemporalAnnotatorGPT(TemporalAnnotator):
                 for p in self.comparison_paths:
                     self.paths.append(self.create_path_item(p, yaws=None))
 
-                while True:
-                    show_now = self.preview_mode and (self.frame_idx % self.preview_stride == 0)
-                    self.draw(show_window=show_now)
-                    if self.active_pair_idx == 0:
-                        print(f"[INFO] Processing frame {self.frame_idx} of {len(self.frames)}")
-                    cur = self.active_pairs[self.active_pair_idx] if self.active_pair_idx < len(self.active_pairs) else None
-                    if cur is None:
-                        # nothing to compare; advance
-                        self._finalize_and_advance = True
+                pairs = self.active_pairs[:]
+                futures = []
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    for pair in pairs:
+                        img_pair = self.render_pair_image(pair)
+                        futures.append((pair, ex.submit(self.gpt.choose, img_pair, self.frame_idx, self.robot_width)))
+
+                for pair, fut in futures:
+                    model_out = fut.result()
+                    raw_choice = int(model_out.get("choice", TIE_BOTH))
+                    meta = {"reason": model_out.get("reason",""), "scores": model_out.get("scores",{})}
+                    left_idx, right_idx = self._pair_left_right_indices(pair)
+
+                    if raw_choice == 1:          # BLUE == LEFT
+                        self._record_choice(pair, left_idx, meta)
+                    elif raw_choice == 2:        # ORANGE == RIGHT
+                        self._record_choice(pair, right_idx, meta)
+                    elif raw_choice == 500:
+                        self._record_choice(pair, BAD_BOTH, meta)
                     else:
-                        # Send the *rendered* image with corridors to the model
-                        model_out = self.gpt.choose(self.current_img_show, self.frame_idx, self.robot_width)
-                        raw_choice = int(model_out.get("choice", TIE_BOTH))
+                        self._record_choice(pair, TIE_BOTH, meta)
 
-                        # Map model label to your internal indices
-                        # RED == left index of pair, GREEN == right index of pair
-                        if raw_choice == 1:
-                            self._record_choice(cur[0], {"reason": model_out.get("reason", ""), "scores": model_out.get("scores", {})})
-                        elif raw_choice == 2:
-                            self._record_choice(cur[1], {"reason": model_out.get("reason", ""), "scores": model_out.get("scores", {})})
-                        elif raw_choice == 500:
-                            self._record_choice(BAD_BOTH, {"reason": model_out.get("reason", ""), "scores": model_out.get("scores", {})})
-                        else:  # 404 or anything else
-                            self._record_choice(TIE_BOTH, {"reason": model_out.get("reason", ""), "scores": model_out.get("scores", {})})
-
-                    if self._finalize_and_advance:
-                        self.log_frame()
-                        i += 1
-                        break
+                self.log_frame()
+                i += 1
 
         finally:
             self._close_bag_doc()

@@ -26,6 +26,11 @@ def extract_all_images():
 
         bag_path = os.path.join(bag_file_root, bag_file)
         output_dir = os.path.join(output_root, os.path.splitext(bag_file)[0])
+
+        # If the directory exists we can skip it entirely
+        if os.path.exists(output_dir):
+            print(f"[INFO] Images already extracted for {bag_file}, skipping.")
+            continue
         os.makedirs(output_dir, exist_ok=True)
 
         print(f"[INFO] Processing {bag_file}")
@@ -39,7 +44,11 @@ def extract_all_images():
             for topic, msg, t in bag.read_messages(topics=[image_topic]):
                 cv_img = bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
                 img_filename = os.path.join(output_dir, f"img_{str(t)}.png")
-                cv2.imwrite(img_filename, cv_img)
+                # Save image only if it doesn't already exist
+                if os.path.exists(img_filename):
+                    continue
+                else:
+                    cv2.imwrite(img_filename, cv_img)
                 img_count += 1
             print(f"[INFO] Extracted {img_count} images from {bag_file}")
 
